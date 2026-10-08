@@ -56,9 +56,12 @@ type
     FDeleteButton: TButton;
     FSearchButton: TButton;
     FColumnsButton: TButton;
+    FExportButton: TButton;
     FSearchFrame: TFrame;
     FSearchEdit: TEdit;
     FFilterCheck: TCheckBox;
+    FFooterPanel: TPanel;
+    FFooterLabel: TLabel;
     FFilteredDataSet: TClientDataSet;
     FSortedDataSet: TClientDataSet;
     FSortFields: TStringList;
@@ -74,6 +77,7 @@ type
     procedure SelectDataSet(Sender: TObject);
     procedure DataChanged(Sender: TObject; Field: TField);
     procedure UpdateButtons;
+    procedure UpdateFooter;
     procedure OpenEditor(AIsNew: Boolean);
     procedure NewClick(Sender: TObject);
     procedure EditClick(Sender: TObject);
@@ -81,6 +85,7 @@ type
     procedure DeleteClick(Sender: TObject);
     procedure SearchClick(Sender: TObject);
     procedure ColumnsClick(Sender: TObject);
+    procedure ExportClick(Sender: TObject);
     procedure ApplyColumnVisibility;
     procedure CloseSearchClick(Sender: TObject);
     procedure SearchChanged(Sender: TObject);
@@ -163,6 +168,15 @@ begin
     end;
     Result[I] := Char(HighDigit * 16 + LowDigit);
   end;
+end;
+
+function EscapeCsvField(const Value: string): string;
+begin
+  if (Pos(';', Value) > 0) or (Pos('"', Value) > 0) or
+    (Pos(#13, Value) > 0) or (Pos(#10, Value) > 0) then
+    Result := '"' + StringReplace(Value, '"', '""', [rfReplaceAll]) + '"'
+  else
+    Result := Value;
 end;
 
 function FilterOperatorAllowed(Field: TField;
@@ -528,9 +542,9 @@ begin
   FSettingsPath := ExtractFilePath(ParamStr(0)) + 'DelphiCDSDemo.ini';
   Caption := 'Gestion generica de ClientDataSet';
   Position := poScreenCenter;
-  Width := 880;
+  Width := 980;
   Height := 560;
-  Constraints.MinWidth := 810;
+  Constraints.MinWidth := 910;
 
   FDemo := TDemoData.Create(Self);
   FSource := TDataSource.Create(Self);
@@ -608,6 +622,14 @@ begin
   FColumnsButton.Caption := 'Columnas...';
   FColumnsButton.OnClick := ColumnsClick;
 
+  FExportButton := TButton.Create(Self);
+  FExportButton.Parent := Bar;
+  FExportButton.Left := 790;
+  FExportButton.Top := 28;
+  FExportButton.Width := 90;
+  FExportButton.Caption := 'Exportar...';
+  FExportButton.OnClick := ExportClick;
+
   FSearchFrame := TFrame.Create(Self);
   FSearchFrame.Parent := Self;
   FSearchFrame.Align := alTop;
@@ -664,6 +686,21 @@ begin
   FGrid.OnSortState := GridSortState;
   FGrid.OnColumnMoved := GridColumnMoved;
   FGrid.OnLayoutChanged := GridLayoutChanged;
+
+  FFooterPanel := TPanel.Create(Self);
+  FFooterPanel.Parent := Self;
+  FFooterPanel.Align := alBottom;
+  FFooterPanel.Height := 24;
+  FFooterPanel.BevelOuter := bvNone;
+
+  FFooterLabel := TLabel.Create(Self);
+  FFooterLabel.Parent := FFooterPanel;
+  FFooterLabel.Align := alRight;
+  FFooterLabel.Alignment := taRightJustify;
+  FFooterLabel.Layout := tlCenter;
+  FFooterLabel.AutoSize := False;
+  FFooterLabel.Width := 258;
+  FFooterLabel.Caption := 'Registro 0 de 0 ';
 
   FSource.OnDataChange := DataChanged;
   SelectDataSet(nil);
@@ -1031,6 +1068,7 @@ begin
   if CanEdit then
     CanEdit := C.CanModify;
   FNewButton.Enabled := CanEdit;
+  FExportButton.Enabled := CanEdit;
   if CanEdit then
   begin
     FEditButton.Enabled := not C.IsEmpty;
@@ -1041,6 +1079,33 @@ begin
     FEditButton.Enabled := False;
     FDeleteButton.Enabled := False;
   end;
+  UpdateFooter;
+end;
+
+procedure TMainForm.UpdateFooter;
+var
+  C: TClientDataSet;
+  X, Y: Integer;
+begin
+  X := 0;
+  Y := 0;
+  C := SelectedDataSet;
+  if Assigned(C) and C.Active and (FGrid.DataSource.DataSet = C) then
+    if not C.IsEmpty then
+    begin
+      Y := C.RecordCount;
+      try
+        X := C.RecNo;
+      except
+        X := 0;
+      end;
+      if X < 1 then
+        X := 0
+      else if X > Y then
+        X := Y;
+    end;
+  if Assigned(FFooterLabel) then
+    FFooterLabel.Caption := Format('Registro %d de %d ', [X, Y]);
 end;
 
 procedure TMainForm.OpenEditor(AIsNew: Boolean);
@@ -1204,6 +1269,127 @@ begin
     end;
   finally
     Chooser.Free;
+  end;
+end;
+
+procedure TMainForm.ExportClick(Sender: TObject);
+var
+  C: TClientDataSet;
+  Dialog: TSaveDialog;
+  Stream: TFileStream;
+  Columns: TList;
+  I, Exported: Integer;
+  Line, Utf8Line: string;
+  Utf8Data: UTF8String;
+  Bom: array[0..2] of Byte;
+  Bookmark: TBookmark;
+
+  procedure WriteLine(const S: string);
+  begin
+    Utf8Line := S + #13#10;
+    Utf8Data := UTF8Encode(Utf8Line);
+    if Length(Utf8Data) > 0 then
+      Stream.WriteBuffer(PChar(Utf8Data)^, Length(Utf8Data));
+  end;
+
+  function BuildLine(Header: Boolean): string;
+  var
+    J: Integer;
+    Column: TColumn;
+  begin
+    Result := '';
+    for J := 0 to Columns.Count - 1 do
+    begin
+      Column := TColumn(Columns[J]);
+      if J > 0 then
+        Result := Result + ';';
+      if Header then
+        Result := Result + EscapeCsvField(Column.Field.DisplayLabel)
+      else
+        Result := Result + EscapeCsvField(Column.Field.DisplayText);
+    end;
+  end;
+
+begin
+  C := SelectedDataSet;
+  if not Assigned(C) or not C.Active then
+    Exit;
+  Columns := TList.Create;
+  try
+    try
+      for I := 0 to FGrid.Columns.Count - 1 do
+        if (FGrid.Columns[I].Field <> nil) and FGrid.Columns[I].Visible then
+          Columns.Add(FGrid.Columns[I]);
+      if Columns.Count = 0 then
+      begin
+        MessageDlg('No hay columnas visibles para exportar.',
+          mtInformation, [mbOK], 0);
+        Exit;
+      end;
+      if C.IsEmpty then
+      begin
+        MessageDlg('No hay registros para exportar.',
+          mtInformation, [mbOK], 0);
+        Exit;
+      end;
+      Dialog := TSaveDialog.Create(Self);
+      try
+        Dialog.Filter := 'CSV (*.csv)|*.csv';
+        Dialog.DefaultExt := 'csv';
+        if (FSelector.ItemIndex >= 0) and
+          (FSelector.ItemIndex < FSelector.Items.Count) then
+          Dialog.FileName := FSelector.Items[FSelector.ItemIndex] + '.csv'
+        else
+          Dialog.FileName := 'Datos.csv';
+        Dialog.Options := Dialog.Options + [ofOverwritePrompt,
+          ofPathMustExist, ofHideReadOnly];
+        if not Dialog.Execute then
+          Exit;
+        Line := Dialog.FileName;
+      finally
+        Dialog.Free;
+      end;
+      Stream := TFileStream.Create(Line, fmCreate);
+      try
+        Bom[0] := $EF;
+        Bom[1] := $BB;
+        Bom[2] := $BF;
+        Stream.WriteBuffer(Bom, SizeOf(Bom));
+        Bookmark := C.GetBookmark;
+        C.DisableControls;
+        try
+          try
+            C.First;
+            WriteLine(BuildLine(True));
+            Exported := 0;
+            while not C.Eof do
+            begin
+              WriteLine(BuildLine(False));
+              Inc(Exported);
+              C.Next;
+            end;
+          finally
+            try
+              C.GotoBookmark(Bookmark);
+            except
+            end;
+            C.FreeBookmark(Bookmark);
+          end;
+        finally
+          C.EnableControls;
+        end;
+      finally
+        Stream.Free;
+      end;
+      MessageDlg(Format('Se exportaron %d registros a %s.',
+        [Exported, Line]), mtInformation, [mbOK], 0);
+    except
+      on E: Exception do
+        MessageDlg('No se pudo exportar: ' + E.Message,
+          mtError, [mbOK], 0);
+    end;
+  finally
+    Columns.Free;
   end;
 end;
 
@@ -1430,6 +1616,7 @@ begin
   if (C <> nil) and C.Active and not C.IsEmpty then
     C.First;
   UpdateSortTitles;
+  UpdateFooter;
 end;
 
 procedure TMainForm.UpdateSortTitles;

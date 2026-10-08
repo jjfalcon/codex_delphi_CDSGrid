@@ -2,3 +2,6 @@
 *.exe
 *.dcu
 *.dsk
+
+# Per-user grid layout beside the executable
+DelphiCDSDemo.ini

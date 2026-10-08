@@ -17,6 +17,7 @@ type
     Value: string;
     NumberValue: Double;
     DateValue: TDateTime;
+    procedure SetValueForField(Field: TField; const AValue: string);
     function Matches(Field: TField): Boolean;
   end;
 
@@ -82,6 +83,21 @@ end;
 function IsDateField(Field: TField): Boolean;
 begin
   Result := Field.DataType in [ftDate, ftTime, ftDateTime];
+end;
+
+procedure TFilterCondition.SetValueForField(Field: TField;
+  const AValue: string);
+begin
+  Value := Trim(AValue);
+  if IsNumberField(Field) then
+    NumberValue := StrToFloat(Value)
+  else if IsDateField(Field) then
+    case Field.DataType of
+      ftDate: DateValue := StrToDate(Value);
+      ftTime: DateValue := StrToTime(Value);
+    else
+      DateValue := StrToDateTime(Value);
+    end;
 end;
 
 function TFilterCondition.Matches(Field: TField): Boolean;
@@ -422,16 +438,7 @@ begin
           Condition.Join := fjOr
         else
           Condition.Join := fjAnd;
-        Condition.Value := Trim(Row.ValueEdit.Text);
-        if IsNumberField(FField) then
-          Condition.NumberValue := StrToFloat(Condition.Value)
-        else if IsDateField(FField) then
-          case FField.DataType of
-            ftDate: Condition.DateValue := StrToDate(Condition.Value);
-            ftTime: Condition.DateValue := StrToTime(Condition.Value);
-          else
-            Condition.DateValue := StrToDateTime(Condition.Value);
-          end;
+        Condition.SetValueForField(FField, Row.ValueEdit.Text);
         NewFilter.Add(Condition);
       except
         Condition.Free;

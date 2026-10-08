@@ -19,10 +19,12 @@ type
     FOnFilterState: TFilterStateEvent;
     FOnFilterClick: TFilterClickEvent;
     FOnSortState: TSortStateEvent;
+    FOnLayoutChanged: TNotifyEvent;
     function SortIconAt(X, Y: Integer): Integer;
     function FilterIconAt(X, Y: Integer): Integer;
   protected
     procedure ColWidthsChanged; override;
+    procedure ColumnMoved(FromIndex, ToIndex: Longint); override;
     procedure Resize; override;
     procedure DrawCell(ACol, ARow: Longint; ARect: TRect;
       AState: TGridDrawState); override;
@@ -39,6 +41,8 @@ type
       write FOnFilterClick;
     property OnSortState: TSortStateEvent read FOnSortState
       write FOnSortState;
+    property OnLayoutChanged: TNotifyEvent read FOnLayoutChanged
+      write FOnLayoutChanged;
   end;
 
   TMainForm = class(TForm)
@@ -61,6 +65,11 @@ type
     FColumnFilters: TStringList;
     FHiddenColumns: array[0..3] of TStringList;
     FSearchText: string;
+    FSettingsPath: string;
+    FActiveDataSetIndex: Integer;
+    FLoadingConfig: Boolean;
+    FSettingsWarningShown: Boolean;
+    FConfigSaveTimer: TTimer;
     function SelectedDataSet: TClientDataSet;
     procedure SelectDataSet(Sender: TObject);
     procedure DataChanged(Sender: TObject; Field: TField);
@@ -78,6 +87,14 @@ type
     procedure ApplySearch;
     procedure SearchFilterRecord(DataSet: TDataSet; var Accept: Boolean);
     procedure GridTitleClick(Column: TColumn);
+    procedure GridColumnMoved(Sender: TObject;
+      FromIndex, ToIndex: Integer);
+    procedure GridLayoutChanged(Sender: TObject);
+    procedure ConfigSaveTimerTick(Sender: TObject);
+    procedure MarkConfigChanged;
+    procedure SaveCurrentConfig;
+    procedure LoadCurrentConfig;
+    function FindGridColumn(const FieldName: string): TColumn;
     procedure ApplySort;
     procedure ClearSort;
     procedure UpdateSortTitles;
@@ -98,11 +115,89 @@ var
 implementation
 
 uses
-  SysUtils, Graphics, Dialogs, RecordEditor, ColumnChooser;
+  SysUtils, Graphics, Dialogs, IniFiles, RecordEditor, ColumnChooser;
+
+function HexEncode(const Value: string): string;
+const
+  Digits = '0123456789ABCDEF';
+var
+  I: Integer;
+  B: Byte;
+begin
+  SetLength(Result, Length(Value) * 2);
+  for I := 1 to Length(Value) do
+  begin
+    B := Ord(Value[I]);
+    Result[I * 2 - 1] := Digits[(B shr 4) + 1];
+    Result[I * 2] := Digits[(B and $0F) + 1];
+  end;
+end;
+
+function HexDigit(C: Char): Integer;
+begin
+  case C of
+    '0'..'9': Result := Ord(C) - Ord('0');
+    'A'..'F': Result := Ord(C) - Ord('A') + 10;
+    'a'..'f': Result := Ord(C) - Ord('a') + 10;
+  else
+    Result := -1;
+  end;
+end;
+
+function HexDecode(const Value: string): string;
+var
+  I, HighDigit, LowDigit: Integer;
+begin
+  Result := '';
+  if (Length(Value) mod 2) <> 0 then
+    Exit;
+  SetLength(Result, Length(Value) div 2);
+  for I := 1 to Length(Result) do
+  begin
+    HighDigit := HexDigit(Value[I * 2 - 1]);
+    LowDigit := HexDigit(Value[I * 2]);
+    if (HighDigit < 0) or (LowDigit < 0) then
+    begin
+      Result := '';
+      Exit;
+    end;
+    Result[I] := Char(HighDigit * 16 + LowDigit);
+  end;
+end;
+
+function FilterOperatorAllowed(Field: TField;
+  AOperator: TFilterOperator): Boolean;
+begin
+  if Field.DataType = ftBoolean then
+    Result := AOperator in [foTrue, foFalse]
+  else if Field.DataType in [ftSmallint, ftInteger, ftWord, ftFloat,
+    ftCurrency, ftBCD, ftAutoInc, ftLargeint, ftDate, ftTime, ftDateTime] then
+    Result := AOperator in [foEqual, foNotEqual, foGreater, foLess]
+  else
+    Result := AOperator in [foContains, foNotContains, foEqual, foNotEqual];
+end;
 
 procedure TAutoFitDBGrid.ColWidthsChanged;
 begin
   inherited ColWidthsChanged;
+  StretchBlankColumn;
+  if Assigned(FOnLayoutChanged) then
+    FOnLayoutChanged(Self);
+end;
+
+procedure TAutoFitDBGrid.ColumnMoved(FromIndex, ToIndex: Longint);
+var
+  I: Integer;
+begin
+  inherited ColumnMoved(FromIndex, ToIndex);
+  if FHasBlankColumn then
+    for I := 0 to Columns.Count - 1 do
+      if Columns[I].Field = nil then
+      begin
+        if I <> Columns.Count - 1 then
+          Columns[I].Index := Columns.Count - 1;
+        Break;
+      end;
   StretchBlankColumn;
 end;
 
@@ -428,6 +523,9 @@ var
   I: Integer;
 begin
   inherited CreateNew(AOwner);
+  FLoadingConfig := True;
+  FActiveDataSetIndex := -1;
+  FSettingsPath := ExtractFilePath(ParamStr(0)) + 'DelphiCDSDemo.ini';
   Caption := 'Gestion generica de ClientDataSet';
   Position := poScreenCenter;
   Width := 880;
@@ -440,6 +538,10 @@ begin
   FColumnFilters := TStringList.Create;
   for I := Low(FHiddenColumns) to High(FHiddenColumns) do
     FHiddenColumns[I] := TStringList.Create;
+  FConfigSaveTimer := TTimer.Create(Self);
+  FConfigSaveTimer.Enabled := False;
+  FConfigSaveTimer.Interval := 350;
+  FConfigSaveTimer.OnTimer := ConfigSaveTimerTick;
 
   Bar := TPanel.Create(Self);
   Bar.Parent := Self;
@@ -548,7 +650,8 @@ begin
   FGrid.Parent := Self;
   FGrid.Align := alClient;
   FGrid.ReadOnly := True;
-  FGrid.Options := (FGrid.Options + [dgRowSelect, dgAlwaysShowSelection]) -
+  FGrid.Options := (FGrid.Options +
+    [dgRowSelect, dgAlwaysShowSelection]) -
     [dgEditing];
   FGrid.DataSource := FSource;
   FGrid.OnDblClick := GridDblClick;
@@ -559,6 +662,8 @@ begin
   FGrid.OnFilterState := GridFilterState;
   FGrid.OnFilterClick := GridFilterClick;
   FGrid.OnSortState := GridSortState;
+  FGrid.OnColumnMoved := GridColumnMoved;
+  FGrid.OnLayoutChanged := GridLayoutChanged;
 
   FSource.OnDataChange := DataChanged;
   SelectDataSet(nil);
@@ -568,9 +673,12 @@ destructor TMainForm.Destroy;
 var
   I: Integer;
 begin
+  FConfigSaveTimer.Enabled := False;
+  SaveCurrentConfig;
   FGrid.OnFilterState := nil;
   FGrid.OnFilterClick := nil;
   FGrid.OnSortState := nil;
+  FGrid.OnLayoutChanged := nil;
   ClearColumnFilters;
   FColumnFilters.Free;
   FSortFields.Free;
@@ -590,23 +698,322 @@ procedure TMainForm.SelectDataSet(Sender: TObject);
 var
   C: TClientDataSet;
 begin
-  if FFilteredDataSet <> nil then
-  begin
-    FFilteredDataSet.Filtered := False;
-    FFilteredDataSet.OnFilterRecord := nil;
-    FFilteredDataSet := nil;
+  FConfigSaveTimer.Enabled := False;
+  SaveCurrentConfig;
+  FLoadingConfig := True;
+  try
+    if FFilteredDataSet <> nil then
+    begin
+      FFilteredDataSet.Filtered := False;
+      FFilteredDataSet.OnFilterRecord := nil;
+      FFilteredDataSet := nil;
+    end;
+    ClearSort;
+    ClearColumnFilters;
+    FActiveDataSetIndex := FSelector.ItemIndex;
+    C := SelectedDataSet;
+    if C <> nil then
+      if C.Active then
+        if not C.IsEmpty then
+          C.First;
+    FGrid.ShowDataSet(C);
+    LoadCurrentConfig;
+    ApplySearch;
+    UpdateButtons;
+  finally
+    FLoadingConfig := False;
   end;
-  ClearSort;
-  ClearColumnFilters;
-  C := SelectedDataSet;
-  if C <> nil then
-    if C.Active then
-      if not C.IsEmpty then
-        C.First;
-  FGrid.ShowDataSet(C);
-  ApplyColumnVisibility;
-  ApplySearch;
-  UpdateButtons;
+end;
+
+function TMainForm.FindGridColumn(const FieldName: string): TColumn;
+var
+  I: Integer;
+begin
+  Result := nil;
+  for I := 0 to FGrid.Columns.Count - 1 do
+    if (FGrid.Columns[I].Field <> nil) and
+      (AnsiCompareText(FGrid.Columns[I].FieldName, FieldName) = 0) then
+    begin
+      Result := FGrid.Columns[I];
+      Exit;
+    end;
+end;
+
+procedure TMainForm.MarkConfigChanged;
+begin
+  if FLoadingConfig or (FActiveDataSetIndex < 0) then
+    Exit;
+  FConfigSaveTimer.Enabled := False;
+  FConfigSaveTimer.Enabled := True;
+end;
+
+procedure TMainForm.GridLayoutChanged(Sender: TObject);
+begin
+  MarkConfigChanged;
+end;
+
+procedure TMainForm.GridColumnMoved(Sender: TObject;
+  FromIndex, ToIndex: Integer);
+begin
+  MarkConfigChanged;
+end;
+
+procedure TMainForm.ConfigSaveTimerTick(Sender: TObject);
+begin
+  FConfigSaveTimer.Enabled := False;
+  SaveCurrentConfig;
+end;
+
+procedure TMainForm.SaveCurrentConfig;
+var
+  Ini: TMemIniFile;
+  Section, Key, Suffix: string;
+  I, J, Count, WidthValue: Integer;
+  OldWidths: array of Integer;
+  Column: TColumn;
+  Filter: TColumnFilter;
+  Condition: TFilterCondition;
+begin
+  if FLoadingConfig or (FActiveDataSetIndex < 0) or
+    (FActiveDataSetIndex >= FSelector.Items.Count) then
+    Exit;
+  if FGrid.DataSource.DataSet <> FDemo.DataSets[FActiveDataSetIndex] then
+    Exit;
+  Section := FSelector.Items[FActiveDataSetIndex];
+  Ini := nil;
+  try
+    Ini := TMemIniFile.Create(FSettingsPath);
+    SetLength(OldWidths, FGrid.Columns.Count);
+    for I := 0 to FGrid.Columns.Count - 1 do
+      if FGrid.Columns[I].Field <> nil then
+        OldWidths[I] := Ini.ReadInteger(Section,
+          'Width_' + FGrid.Columns[I].FieldName, 80);
+    Ini.EraseSection(Section);
+    Ini.WriteInteger(Section, 'Version', 1);
+    Count := 0;
+    for I := 0 to FGrid.Columns.Count - 1 do
+    begin
+      Column := FGrid.Columns[I];
+      if Column.Field = nil then
+        Continue;
+      Inc(Count);
+      Ini.WriteString(Section, 'Column' + IntToStr(Count),
+        Column.FieldName);
+      WidthValue := Column.Width;
+      if WidthValue < 40 then
+        WidthValue := OldWidths[I];
+      Ini.WriteInteger(Section, 'Width_' + Column.FieldName, WidthValue);
+      Ini.WriteBool(Section, 'Visible_' + Column.FieldName, Column.Visible);
+    end;
+    Ini.WriteInteger(Section, 'ColumnCount', Count);
+
+    Ini.WriteInteger(Section, 'SortCount', FSortFields.Count);
+    for I := 0 to FSortFields.Count - 1 do
+    begin
+      Key := IntToStr(I + 1);
+      Ini.WriteString(Section, 'SortField' + Key, FSortFields[I]);
+      Ini.WriteInteger(Section, 'SortDirection' + Key,
+        Integer(FSortFields.Objects[I]));
+    end;
+
+    Ini.WriteInteger(Section, 'FilterCount', FColumnFilters.Count);
+    for I := 0 to FColumnFilters.Count - 1 do
+    begin
+      Filter := TColumnFilter(FColumnFilters.Objects[I]);
+      Key := IntToStr(I + 1);
+      Ini.WriteString(Section, 'FilterField' + Key, Filter.FieldName);
+      Ini.WriteInteger(Section, 'ConditionCount' + Key, Filter.Count);
+      for J := 0 to Filter.Count - 1 do
+      begin
+        Condition := Filter.Conditions[J];
+        Suffix := Key + '_' + IntToStr(J + 1);
+        Ini.WriteInteger(Section, 'Operator' + Suffix,
+          Ord(Condition.Operator));
+        Ini.WriteInteger(Section, 'Join' + Suffix, Ord(Condition.Join));
+        Ini.WriteString(Section, 'Value' + Suffix,
+          HexEncode(Condition.Value));
+      end;
+    end;
+    Ini.WriteBool(Section, 'GlobalFilterEnabled',
+      FFilterCheck.Checked and (FSearchEdit.Text <> ''));
+    if FFilterCheck.Checked and (FSearchEdit.Text <> '') then
+      Ini.WriteString(Section, 'GlobalFilterText',
+        HexEncode(FSearchEdit.Text));
+    Ini.UpdateFile;
+  except
+    on E: Exception do
+      if not FSettingsWarningShown then
+      begin
+        FSettingsWarningShown := True;
+        MessageDlg('No se pudo guardar la configuracion en ' +
+          FSettingsPath + ': ' + E.Message, mtWarning, [mbOK], 0);
+      end;
+  end;
+  Ini.Free;
+end;
+
+procedure TMainForm.LoadCurrentConfig;
+var
+  Ini: TMemIniFile;
+  Section, FieldName, Key, Suffix, Value: string;
+  I, J, Count, Position, WidthValue, Direction, OpValue, JoinValue: Integer;
+  VisibleCount: Integer;
+  Column: TColumn;
+  Filter: TColumnFilter;
+  Condition: TFilterCondition;
+  Seen: TStringList;
+begin
+  if (FActiveDataSetIndex < 0) or
+    (FActiveDataSetIndex >= FSelector.Items.Count) then
+    Exit;
+  FHiddenColumns[FActiveDataSetIndex].Clear;
+  FSearchEdit.Text := '';
+  FFilterCheck.Checked := False;
+  FSearchText := '';
+  if not FileExists(FSettingsPath) then
+    Exit;
+  Section := FSelector.Items[FActiveDataSetIndex];
+  Ini := TMemIniFile.Create(FSettingsPath);
+  Seen := TStringList.Create;
+  try
+    if Ini.ReadInteger(Section, 'Version', 0) <> 1 then
+      Exit;
+    Count := Ini.ReadInteger(Section, 'ColumnCount', 0);
+    if Count > FGrid.Columns.Count then
+      Count := FGrid.Columns.Count;
+    Position := 0;
+    for I := 1 to Count do
+    begin
+      FieldName := Ini.ReadString(Section, 'Column' + IntToStr(I), '');
+      Column := FindGridColumn(FieldName);
+      if (Column <> nil) and (Seen.IndexOf(FieldName) < 0) then
+      begin
+        Column.Index := Position;
+        Seen.Add(FieldName);
+        Inc(Position);
+      end;
+    end;
+
+    VisibleCount := 0;
+    for I := 0 to FGrid.Columns.Count - 1 do
+    begin
+      Column := FGrid.Columns[I];
+      if Column.Field = nil then
+        Continue;
+      if Ini.ReadBool(Section, 'Visible_' + Column.FieldName, True) then
+        Inc(VisibleCount)
+      else
+        FHiddenColumns[FActiveDataSetIndex].Add(Column.FieldName);
+    end;
+    if (VisibleCount = 0) and (FGrid.Columns.Count > 1) and
+      (FGrid.Columns[0].Field <> nil) then
+    begin
+      J := FHiddenColumns[FActiveDataSetIndex].IndexOf(
+        FGrid.Columns[0].FieldName);
+      if J >= 0 then
+        FHiddenColumns[FActiveDataSetIndex].Delete(J);
+    end;
+    ApplyColumnVisibility;
+
+    Count := Ini.ReadInteger(Section, 'SortCount', 0);
+    if Count > 16 then
+      Count := 16;
+    for I := 1 to Count do
+    begin
+      Key := IntToStr(I);
+      FieldName := Ini.ReadString(Section, 'SortField' + Key, '');
+      Direction := Ini.ReadInteger(Section, 'SortDirection' + Key, 0);
+      Column := FindGridColumn(FieldName);
+      if (Column <> nil) and Column.Visible and
+        not Column.Field.IsBlob and (Direction in [1, 2]) and
+        (FSortFields.IndexOf(FieldName) < 0) then
+        FSortFields.AddObject(FieldName, TObject(Direction));
+    end;
+    if FSortFields.Count > 0 then
+      ApplySort;
+
+    Count := Ini.ReadInteger(Section, 'FilterCount', 0);
+    if Count > 1000 then
+      Count := 1000;
+    for I := 1 to Count do
+    begin
+      Key := IntToStr(I);
+      FieldName := Ini.ReadString(Section, 'FilterField' + Key, '');
+      Column := FindGridColumn(FieldName);
+      if (Column = nil) or not Column.Visible or
+        (FColumnFilters.IndexOf(FieldName) >= 0) then
+        Continue;
+      Filter := TColumnFilter.Create(FieldName);
+      try
+        J := Ini.ReadInteger(Section, 'ConditionCount' + Key, 0);
+        if J > 1000 then
+          J := 1000;
+        for Position := 1 to J do
+        begin
+          Suffix := Key + '_' + IntToStr(Position);
+          OpValue := Ini.ReadInteger(Section, 'Operator' + Suffix, -1);
+          JoinValue := Ini.ReadInteger(Section, 'Join' + Suffix, -1);
+          if (OpValue < Ord(Low(TFilterOperator))) or
+            (OpValue > Ord(High(TFilterOperator))) or
+            (JoinValue < Ord(Low(TFilterJoin))) or
+            (JoinValue > Ord(High(TFilterJoin))) then
+            Continue;
+          if not FilterOperatorAllowed(Column.Field,
+            TFilterOperator(OpValue)) then
+            Continue;
+          Value := HexDecode(Ini.ReadString(Section,
+            'Value' + Suffix, ''));
+          if (Value = '') and not
+            (TFilterOperator(OpValue) in [foTrue, foFalse]) then
+            Continue;
+          Condition := TFilterCondition.Create;
+          try
+            Condition.Operator := TFilterOperator(OpValue);
+            Condition.Join := TFilterJoin(JoinValue);
+            Condition.SetValueForField(Column.Field, Value);
+            Filter.Add(Condition);
+          except
+            Condition.Free;
+          end;
+        end;
+        if Filter.Count > 0 then
+        begin
+          FColumnFilters.AddObject(FieldName, Filter);
+          Filter := nil;
+        end;
+      finally
+        Filter.Free;
+      end;
+    end;
+
+    if Ini.ReadBool(Section, 'GlobalFilterEnabled', False) then
+    begin
+      Value := HexDecode(Ini.ReadString(Section,
+        'GlobalFilterText', ''));
+      if Value <> '' then
+      begin
+        FSearchEdit.Text := Value;
+        FSearchText := AnsiUpperCase(Value);
+        FFilterCheck.Checked := True;
+        FSearchFrame.Visible := True;
+      end;
+    end;
+
+    for I := 0 to FGrid.Columns.Count - 1 do
+    begin
+      Column := FGrid.Columns[I];
+      if Column.Field = nil then
+        Continue;
+      WidthValue := Ini.ReadInteger(Section,
+        'Width_' + Column.FieldName, Column.Width);
+      if (WidthValue >= 40) and (WidthValue <= 2000) then
+        Column.Width := WidthValue;
+    end;
+    FGrid.StretchBlankColumn;
+  finally
+    Seen.Free;
+    Ini.Free;
+  end;
 end;
 
 procedure TMainForm.DataChanged(Sender: TObject; Field: TField);
@@ -759,6 +1166,9 @@ begin
         if not Chooser.ColumnVisible(Column) then
           NewHidden.Add(Column.FieldName);
       end;
+      for I := 0 to Chooser.ColumnCount - 1 do
+        if Chooser.Columns[I].Index <> I then
+          Changed := True;
       if not Changed then
         Exit;
       if FFilteredDataSet <> nil then
@@ -780,11 +1190,15 @@ begin
           FSortFields.Delete(I);
           SortChanged := True;
         end;
+      for I := 0 to Chooser.ColumnCount - 1 do
+        Chooser.Columns[I].Index := I;
+      SaveCurrentConfig;
       FHiddenColumns[FSelector.ItemIndex].Assign(NewHidden);
       ApplyColumnVisibility;
       if SortChanged then
         ApplySort;
       ApplySearch;
+      MarkConfigChanged;
     finally
       NewHidden.Free;
     end;
@@ -810,8 +1224,11 @@ end;
 
 procedure TMainForm.SearchChanged(Sender: TObject);
 begin
+  if FLoadingConfig then
+    Exit;
   FSearchText := AnsiUpperCase(FSearchEdit.Text);
   ApplySearch;
+  MarkConfigChanged;
 end;
 
 procedure TMainForm.ApplySearch;
@@ -925,6 +1342,7 @@ begin
   if NewFilter <> nil then
     FColumnFilters.AddObject(Column.FieldName, NewFilter);
   ApplySearch;
+  MarkConfigChanged;
 end;
 
 procedure TMainForm.GridTitleClick(Column: TColumn);
@@ -962,6 +1380,7 @@ begin
       FSortFields.AddObject(FieldName, TObject(NextDirection));
   end;
   ApplySort;
+  MarkConfigChanged;
 end;
 
 procedure TMainForm.ClearSort;

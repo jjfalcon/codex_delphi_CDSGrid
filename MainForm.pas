@@ -1118,12 +1118,17 @@ procedure TMainForm.OpenEditor(AIsNew: Boolean);
 var
   C: TClientDataSet;
   Editor: TRecordEditorForm;
+  CDSName: string;
 begin
   C := SelectedDataSet;
   if not Assigned(C) or not C.Active or not C.CanModify then
     Exit;
   if not AIsNew and C.IsEmpty then
     Exit;
+  CDSName := '';
+  if (FSelector.ItemIndex >= 0) and
+    (FSelector.ItemIndex < FSelector.Items.Count) then
+    CDSName := FSelector.Items[FSelector.ItemIndex];
 
   try
     if AIsNew then
@@ -1131,7 +1136,7 @@ begin
     else
       C.Edit;
     try
-      Editor := TRecordEditorForm.CreateEditor(Self, C, AIsNew);
+      Editor := TRecordEditorForm.CreateEditor(Self, C, AIsNew, CDSName);
       try
         Editor.ShowModal;
       finally

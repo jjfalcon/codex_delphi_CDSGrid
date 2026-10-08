@@ -1,3 +1,4 @@
 # Delphi build outputs
 *.exe
 *.dcu
+*.dsk

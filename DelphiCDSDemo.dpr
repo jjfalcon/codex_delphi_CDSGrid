@@ -5,7 +5,9 @@ uses
   MidasLib,
   MainForm in 'MainForm.pas',
   DemoData in 'DemoData.pas',
-  RecordEditor in 'RecordEditor.pas';
+  RecordEditor in 'RecordEditor.pas',
+  ColumnFilter in 'ColumnFilter.pas',
+  ColumnChooser in 'ColumnChooser.pas';
 
 begin
   Application.Initialize;

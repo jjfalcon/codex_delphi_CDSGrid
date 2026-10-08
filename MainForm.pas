@@ -4,22 +4,41 @@ interface
 
 uses
   Classes, DB, DBClient, Forms, Controls, StdCtrls, ExtCtrls, DBGrids,
-  DemoData;
+  Windows, Grids,
+  DemoData, ColumnFilter;
 
 type
+  TFilterStateEvent = function(const FieldName: string): Boolean of object;
+  TFilterClickEvent = procedure(Column: TColumn) of object;
+  TSortStateEvent = function(const FieldName: string): Integer of object;
+
   TAutoFitDBGrid = class(TDBGrid)
   private
     FStretchInProgress: Boolean;
     FHasBlankColumn: Boolean;
+    FOnFilterState: TFilterStateEvent;
+    FOnFilterClick: TFilterClickEvent;
+    FOnSortState: TSortStateEvent;
+    function SortIconAt(X, Y: Integer): Integer;
+    function FilterIconAt(X, Y: Integer): Integer;
   protected
     procedure ColWidthsChanged; override;
     procedure Resize; override;
+    procedure DrawCell(ACol, ARow: Longint; ARect: TRect;
+      AState: TGridDrawState); override;
+    procedure TitleClick(Column: TColumn); override;
   public
     procedure ShowDataSet(ADataSet: TDataSet);
     procedure StretchBlankColumn;
     function SeparatorColumnAt(X, Y: Integer): Integer;
     function IsDataCellAt(X, Y: Integer): Boolean;
     procedure FitColumn(AIndex: Integer);
+    property OnFilterState: TFilterStateEvent read FOnFilterState
+      write FOnFilterState;
+    property OnFilterClick: TFilterClickEvent read FOnFilterClick
+      write FOnFilterClick;
+    property OnSortState: TSortStateEvent read FOnSortState
+      write FOnSortState;
   end;
 
   TMainForm = class(TForm)
@@ -31,6 +50,17 @@ type
     FNewButton: TButton;
     FEditButton: TButton;
     FDeleteButton: TButton;
+    FSearchButton: TButton;
+    FColumnsButton: TButton;
+    FSearchFrame: TFrame;
+    FSearchEdit: TEdit;
+    FFilterCheck: TCheckBox;
+    FFilteredDataSet: TClientDataSet;
+    FSortedDataSet: TClientDataSet;
+    FSortFields: TStringList;
+    FColumnFilters: TStringList;
+    FHiddenColumns: array[0..3] of TStringList;
+    FSearchText: string;
     function SelectedDataSet: TClientDataSet;
     procedure SelectDataSet(Sender: TObject);
     procedure DataChanged(Sender: TObject; Field: TField);
@@ -40,8 +70,26 @@ type
     procedure EditClick(Sender: TObject);
     procedure GridDblClick(Sender: TObject);
     procedure DeleteClick(Sender: TObject);
+    procedure SearchClick(Sender: TObject);
+    procedure ColumnsClick(Sender: TObject);
+    procedure ApplyColumnVisibility;
+    procedure CloseSearchClick(Sender: TObject);
+    procedure SearchChanged(Sender: TObject);
+    procedure ApplySearch;
+    procedure SearchFilterRecord(DataSet: TDataSet; var Accept: Boolean);
+    procedure GridTitleClick(Column: TColumn);
+    procedure ApplySort;
+    procedure ClearSort;
+    procedure UpdateSortTitles;
+    procedure ClearColumnFilters;
+    function GridFilterState(const FieldName: string): Boolean;
+    procedure GridFilterClick(Column: TColumn);
+    function GridSortState(const FieldName: string): Integer;
+    procedure GridDrawColumnCell(Sender: TObject; const Rect: TRect;
+      DataCol: Integer; Column: TColumn; State: TGridDrawState);
   public
     constructor Create(AOwner: TComponent); override;
+    destructor Destroy; override;
   end;
 
 var
@@ -50,7 +98,7 @@ var
 implementation
 
 uses
-  Windows, SysUtils, Graphics, Grids, Dialogs, RecordEditor;
+  SysUtils, Graphics, Dialogs, RecordEditor, ColumnChooser;
 
 procedure TAutoFitDBGrid.ColWidthsChanged;
 begin
@@ -62,6 +110,168 @@ procedure TAutoFitDBGrid.Resize;
 begin
   inherited Resize;
   StretchBlankColumn;
+end;
+
+function TAutoFitDBGrid.SortIconAt(X, Y: Integer): Integer;
+var
+  Cell: TGridCoord;
+  R: TRect;
+begin
+  Result := -1;
+  if not PtInRect(ClientRect, Point(X, Y)) then
+    Exit;
+  Cell := MouseCoord(X, Y);
+  if (Cell.Y <> FixedRows - 1) or (Cell.X < IndicatorOffset) then
+    Exit;
+  Result := RawToDataColumn(Cell.X);
+  if (Result < 0) or (Result >= Columns.Count) then
+  begin
+    Result := -1;
+    Exit;
+  end;
+  if (Columns[Result].Field = nil) or Columns[Result].Field.IsBlob then
+  begin
+    Result := -1;
+    Exit;
+  end;
+  R := CellRect(Cell.X, Cell.Y);
+  if (X < R.Left + 2) or (X >= R.Left + 22) then
+    Result := -1;
+end;
+
+function TAutoFitDBGrid.FilterIconAt(X, Y: Integer): Integer;
+var
+  Cell: TGridCoord;
+  R: TRect;
+begin
+  Result := -1;
+  if not PtInRect(ClientRect, Point(X, Y)) then
+    Exit;
+  Cell := MouseCoord(X, Y);
+  if (Cell.Y <> FixedRows - 1) or (Cell.X < IndicatorOffset) then
+    Exit;
+  Result := RawToDataColumn(Cell.X);
+  if (Result < 0) or (Result >= Columns.Count) then
+  begin
+    Result := -1;
+    Exit;
+  end;
+  if Columns[Result].Field = nil then
+  begin
+    Result := -1;
+    Exit;
+  end;
+  R := CellRect(Cell.X, Cell.Y);
+  if (X < R.Right - 23) or (X >= R.Right - 5) then
+    Result := -1;
+end;
+
+procedure TAutoFitDBGrid.DrawCell(ACol, ARow: Longint; ARect: TRect;
+  AState: TGridDrawState);
+var
+  DataIndex, X, Y, Direction: Integer;
+  Active: Boolean;
+  P: array[0..5] of TPoint;
+  Arrow: array[0..2] of TPoint;
+  R: TRect;
+begin
+  inherited DrawCell(ACol, ARow, ARect, AState);
+  if (ARow <> FixedRows - 1) or (ACol < IndicatorOffset) then
+    Exit;
+  DataIndex := RawToDataColumn(ACol);
+  if (DataIndex < 0) or (DataIndex >= Columns.Count) then
+    Exit;
+  if Columns[DataIndex].Field = nil then
+    Exit;
+  if not Columns[DataIndex].Field.IsBlob then
+  begin
+    Direction := 0;
+    if Assigned(FOnSortState) then
+      Direction := FOnSortState(Columns[DataIndex].FieldName);
+    R := ARect;
+    Inc(R.Left, 2);
+    R.Right := R.Left + 18;
+    Canvas.Brush.Color := clBtnFace;
+    Canvas.FillRect(R);
+    X := R.Left + 8;
+    Y := (R.Top + R.Bottom) div 2;
+    if Direction = 0 then
+    begin
+      Canvas.Pen.Color := clGrayText;
+      Canvas.Brush.Color := clBtnFace;
+      Arrow[0] := Point(X - 4, Y - 1);
+      Arrow[1] := Point(X + 4, Y - 1);
+      Arrow[2] := Point(X, Y - 5);
+      Canvas.Polygon(Arrow);
+      Arrow[0] := Point(X - 4, Y + 1);
+      Arrow[1] := Point(X + 4, Y + 1);
+      Arrow[2] := Point(X, Y + 5);
+      Canvas.Polygon(Arrow);
+    end
+    else
+    begin
+      Canvas.Pen.Color := clBlack;
+      Canvas.Brush.Color := clBlack;
+      if Direction = 1 then
+      begin
+        Arrow[0] := Point(X - 4, Y + 3);
+        Arrow[1] := Point(X + 4, Y + 3);
+        Arrow[2] := Point(X, Y - 4);
+      end
+      else
+      begin
+        Arrow[0] := Point(X - 4, Y - 3);
+        Arrow[1] := Point(X + 4, Y - 3);
+        Arrow[2] := Point(X, Y + 4);
+      end;
+      Canvas.Polygon(Arrow);
+    end;
+  end;
+  Active := Assigned(FOnFilterState) and
+    FOnFilterState(Columns[DataIndex].FieldName);
+  R := ARect;
+  R.Left := R.Right - 23;
+  Dec(R.Right, 5);
+  Canvas.Brush.Color := clBtnFace;
+  Canvas.FillRect(R);
+  X := (R.Left + R.Right) div 2;
+  Y := (R.Top + R.Bottom) div 2;
+  P[0] := Point(X - 6, Y - 4);
+  P[1] := Point(X + 6, Y - 4);
+  P[2] := Point(X + 2, Y);
+  P[3] := Point(X + 2, Y + 5);
+  P[4] := Point(X - 1, Y + 3);
+  P[5] := Point(X - 1, Y);
+  if Active then
+  begin
+    R.Left := X - 8;
+    R.Right := X + 8;
+    R.Top := Y - 8;
+    R.Bottom := Y + 8;
+    Canvas.Brush.Color := RGB(55, 115, 55);
+    Canvas.FillRect(R);
+    Canvas.Pen.Color := clWhite;
+    Canvas.Brush.Color := clWhite;
+  end
+  else
+  begin
+    Canvas.Pen.Color := clGrayText;
+    Canvas.Brush.Color := clBtnFace;
+  end;
+  Canvas.Polygon(P);
+end;
+
+procedure TAutoFitDBGrid.TitleClick(Column: TColumn);
+var
+  P: TPoint;
+begin
+  GetCursorPos(P);
+  P := ScreenToClient(P);
+  if (FilterIconAt(P.X, P.Y) = Column.Index) and
+    Assigned(FOnFilterClick) then
+    FOnFilterClick(Column)
+  else if SortIconAt(P.X, P.Y) = Column.Index then
+    inherited TitleClick(Column);
 end;
 
 procedure TAutoFitDBGrid.ShowDataSet(ADataSet: TDataSet);
@@ -79,7 +289,12 @@ begin
     begin
       Column := Columns.Add;
       Column.FieldName := ADataSet.Fields[I].FieldName;
-    end;
+      Column.Width := Column.Width + 24;
+      if not Column.Field.IsBlob then
+      begin
+        Column.Title.Caption := '         ' + Column.Field.DisplayLabel;
+        Column.Width := Column.Width + 30;
+      end;    end;
   Column := Columns.Add;
   Column.Title.Caption := '';
   Column.ReadOnly := True;
@@ -166,7 +381,7 @@ begin
   try
     SavedFont.Assign(Canvas.Font);
     Canvas.Font.Assign(Columns[AIndex].Title.Font);
-    NewWidth := Canvas.TextWidth(Columns[AIndex].Title.Caption) + 16;
+    NewWidth := Canvas.TextWidth(Columns[AIndex].Title.Caption) + 40;
     if (Field <> nil) and (DataSource <> nil) then
     begin
       C := DataSource.DataSet;
@@ -208,15 +423,23 @@ constructor TMainForm.Create(AOwner: TComponent);
 var
   Bar: TPanel;
   SelectorLabel: TLabel;
+  SearchLabel: TLabel;
+  CloseSearchButton: TButton;
+  I: Integer;
 begin
   inherited CreateNew(AOwner);
   Caption := 'Gestion generica de ClientDataSet';
   Position := poScreenCenter;
   Width := 880;
   Height := 560;
+  Constraints.MinWidth := 810;
 
   FDemo := TDemoData.Create(Self);
   FSource := TDataSource.Create(Self);
+  FSortFields := TStringList.Create;
+  FColumnFilters := TStringList.Create;
+  for I := Low(FHiddenColumns) to High(FHiddenColumns) do
+    FHiddenColumns[I] := TStringList.Create;
 
   Bar := TPanel.Create(Self);
   Bar.Parent := Self;
@@ -267,6 +490,60 @@ begin
   FDeleteButton.Caption := 'Borrar';
   FDeleteButton.OnClick := DeleteClick;
 
+  FSearchButton := TButton.Create(Self);
+  FSearchButton.Parent := Bar;
+  FSearchButton.Left := 590;
+  FSearchButton.Top := 28;
+  FSearchButton.Width := 90;
+  FSearchButton.Caption := 'Buscar';
+  FSearchButton.OnClick := SearchClick;
+
+  FColumnsButton := TButton.Create(Self);
+  FColumnsButton.Parent := Bar;
+  FColumnsButton.Left := 690;
+  FColumnsButton.Top := 28;
+  FColumnsButton.Width := 90;
+  FColumnsButton.Caption := 'Columnas...';
+  FColumnsButton.OnClick := ColumnsClick;
+
+  FSearchFrame := TFrame.Create(Self);
+  FSearchFrame.Parent := Self;
+  FSearchFrame.Align := alTop;
+  FSearchFrame.Height := 44;
+  FSearchFrame.Visible := False;
+
+  SearchLabel := TLabel.Create(Self);
+  SearchLabel.Parent := FSearchFrame;
+  SearchLabel.Left := 16;
+  SearchLabel.Top := 14;
+  SearchLabel.Caption := 'Buscar texto:';
+
+  FSearchEdit := TEdit.Create(Self);
+  FSearchEdit.Parent := FSearchFrame;
+  FSearchEdit.Left := 105;
+  FSearchEdit.Top := 10;
+  FSearchEdit.Width := FSearchFrame.Width - 305;
+  FSearchEdit.Anchors := [akLeft, akTop, akRight];
+  FSearchEdit.OnChange := SearchChanged;
+
+  FFilterCheck := TCheckBox.Create(Self);
+  FFilterCheck.Parent := FSearchFrame;
+  FFilterCheck.Left := FSearchFrame.Width - 190;
+  FFilterCheck.Top := 12;
+  FFilterCheck.Width := 85;
+  FFilterCheck.Caption := 'Filtrar';
+  FFilterCheck.Anchors := [akTop, akRight];
+  FFilterCheck.OnClick := SearchChanged;
+
+  CloseSearchButton := TButton.Create(Self);
+  CloseSearchButton.Parent := FSearchFrame;
+  CloseSearchButton.Left := FSearchFrame.Width - 91;
+  CloseSearchButton.Top := 9;
+  CloseSearchButton.Width := 75;
+  CloseSearchButton.Caption := 'Cerrar';
+  CloseSearchButton.Anchors := [akTop, akRight];
+  CloseSearchButton.OnClick := CloseSearchClick;
+
   FGrid := TAutoFitDBGrid.Create(Self);
   FGrid.Parent := Self;
   FGrid.Align := alClient;
@@ -275,9 +552,31 @@ begin
     [dgEditing];
   FGrid.DataSource := FSource;
   FGrid.OnDblClick := GridDblClick;
+  FGrid.Hint := 'Flechas: ordenar; Mayus + clic: combinar; embudo: filtrar.';
+  FGrid.ShowHint := True;
+  FGrid.OnDrawColumnCell := GridDrawColumnCell;
+  FGrid.OnTitleClick := GridTitleClick;
+  FGrid.OnFilterState := GridFilterState;
+  FGrid.OnFilterClick := GridFilterClick;
+  FGrid.OnSortState := GridSortState;
 
   FSource.OnDataChange := DataChanged;
   SelectDataSet(nil);
+end;
+
+destructor TMainForm.Destroy;
+var
+  I: Integer;
+begin
+  FGrid.OnFilterState := nil;
+  FGrid.OnFilterClick := nil;
+  FGrid.OnSortState := nil;
+  ClearColumnFilters;
+  FColumnFilters.Free;
+  FSortFields.Free;
+  for I := Low(FHiddenColumns) to High(FHiddenColumns) do
+    FHiddenColumns[I].Free;
+  inherited Destroy;
 end;
 
 function TMainForm.SelectedDataSet: TClientDataSet;
@@ -291,12 +590,22 @@ procedure TMainForm.SelectDataSet(Sender: TObject);
 var
   C: TClientDataSet;
 begin
+  if FFilteredDataSet <> nil then
+  begin
+    FFilteredDataSet.Filtered := False;
+    FFilteredDataSet.OnFilterRecord := nil;
+    FFilteredDataSet := nil;
+  end;
+  ClearSort;
+  ClearColumnFilters;
   C := SelectedDataSet;
   if C <> nil then
     if C.Active then
       if not C.IsEmpty then
         C.First;
   FGrid.ShowDataSet(C);
+  ApplyColumnVisibility;
+  ApplySearch;
   UpdateButtons;
 end;
 
@@ -404,6 +713,350 @@ begin
       MessageDlg('No se pudo borrar: ' + E.Message, mtError, [mbOK], 0);
   end;
   UpdateButtons;
+end;
+
+procedure TMainForm.ApplyColumnVisibility;
+var
+  I: Integer;
+  Hidden: TStringList;
+begin
+  if (FSelector.ItemIndex < Low(FHiddenColumns)) or
+    (FSelector.ItemIndex > High(FHiddenColumns)) then
+    Exit;
+  Hidden := FHiddenColumns[FSelector.ItemIndex];
+  for I := 0 to FGrid.Columns.Count - 1 do
+    if FGrid.Columns[I].Field <> nil then
+      FGrid.Columns[I].Visible :=
+        Hidden.IndexOf(FGrid.Columns[I].FieldName) < 0;
+  FGrid.StretchBlankColumn;
+end;
+
+procedure TMainForm.ColumnsClick(Sender: TObject);
+var
+  Chooser: TColumnChooserForm;
+  NewHidden: TStringList;
+  I: Integer;
+  Changed, SortChanged: Boolean;
+  Column: TColumn;
+begin
+  if (FSelector.ItemIndex < Low(FHiddenColumns)) or
+    (FSelector.ItemIndex > High(FHiddenColumns)) then
+    Exit;
+  Chooser := TColumnChooserForm.CreateForGrid(Self, FGrid);
+  try
+    if Chooser.ShowModal <> mrOk then
+      Exit;
+    NewHidden := TStringList.Create;
+    try
+      Changed := False;
+      for I := 0 to FGrid.Columns.Count - 1 do
+      begin
+        Column := FGrid.Columns[I];
+        if Column.Field = nil then
+          Continue;
+        if Column.Visible <> Chooser.ColumnVisible(Column) then
+          Changed := True;
+        if not Chooser.ColumnVisible(Column) then
+          NewHidden.Add(Column.FieldName);
+      end;
+      if not Changed then
+        Exit;
+      if FFilteredDataSet <> nil then
+      begin
+        FFilteredDataSet.Filtered := False;
+        FFilteredDataSet.OnFilterRecord := nil;
+        FFilteredDataSet := nil;
+      end;
+      for I := FColumnFilters.Count - 1 downto 0 do
+        if NewHidden.IndexOf(FColumnFilters[I]) >= 0 then
+        begin
+          FColumnFilters.Objects[I].Free;
+          FColumnFilters.Delete(I);
+        end;
+      SortChanged := False;
+      for I := FSortFields.Count - 1 downto 0 do
+        if NewHidden.IndexOf(FSortFields[I]) >= 0 then
+        begin
+          FSortFields.Delete(I);
+          SortChanged := True;
+        end;
+      FHiddenColumns[FSelector.ItemIndex].Assign(NewHidden);
+      ApplyColumnVisibility;
+      if SortChanged then
+        ApplySort;
+      ApplySearch;
+    finally
+      NewHidden.Free;
+    end;
+  finally
+    Chooser.Free;
+  end;
+end;
+
+procedure TMainForm.SearchClick(Sender: TObject);
+begin
+  FSearchFrame.Visible := True;
+  FSearchEdit.SetFocus;
+  FSearchEdit.SelectAll;
+end;
+
+procedure TMainForm.CloseSearchClick(Sender: TObject);
+begin
+  FSearchEdit.Clear;
+  FFilterCheck.Checked := False;
+  FSearchFrame.Visible := False;
+  FGrid.SetFocus;
+end;
+
+procedure TMainForm.SearchChanged(Sender: TObject);
+begin
+  FSearchText := AnsiUpperCase(FSearchEdit.Text);
+  ApplySearch;
+end;
+
+procedure TMainForm.ApplySearch;
+var
+  C: TClientDataSet;
+begin
+  if FFilteredDataSet <> nil then
+  begin
+    FFilteredDataSet.Filtered := False;
+    FFilteredDataSet.OnFilterRecord := nil;
+    FFilteredDataSet := nil;
+  end;
+  C := SelectedDataSet;
+  if (C <> nil) and C.Active and
+    ((FColumnFilters.Count > 0) or
+    (FFilterCheck.Checked and (FSearchText <> ''))) then
+  begin
+    C.OnFilterRecord := SearchFilterRecord;
+    C.Filtered := True;
+    FFilteredDataSet := C;
+    if not C.IsEmpty then
+      C.First;
+  end;
+  FGrid.Invalidate;
+  UpdateButtons;
+end;
+
+procedure TMainForm.SearchFilterRecord(DataSet: TDataSet;
+  var Accept: Boolean);
+var
+  I: Integer;
+  Field: TField;
+  ColumnFilter: TColumnFilter;
+begin
+  Accept := True;
+  for I := 0 to FColumnFilters.Count - 1 do
+  begin
+    ColumnFilter := TColumnFilter(FColumnFilters.Objects[I]);
+    Field := DataSet.FieldByName(ColumnFilter.FieldName);
+    if not ColumnFilter.Matches(Field) then
+    begin
+      Accept := False;
+      Exit;
+    end;
+  end;
+  if not FFilterCheck.Checked or (FSearchText = '') then
+    Exit;
+  Accept := False;
+  for I := 0 to FGrid.Columns.Count - 1 do
+    if FGrid.Columns[I].Visible then
+    begin
+      Field := FGrid.Columns[I].Field;
+      if (Field <> nil) and
+        (Pos(FSearchText, AnsiUpperCase(Field.DisplayText)) > 0) then
+      begin
+        Accept := True;
+        Exit;
+      end;
+    end;
+end;
+
+procedure TMainForm.ClearColumnFilters;
+var
+  I: Integer;
+begin
+  for I := 0 to FColumnFilters.Count - 1 do
+    FColumnFilters.Objects[I].Free;
+  FColumnFilters.Clear;
+end;
+
+function TMainForm.GridFilterState(const FieldName: string): Boolean;
+begin
+  Result := FColumnFilters.IndexOf(FieldName) >= 0;
+end;
+
+function TMainForm.GridSortState(const FieldName: string): Integer;
+var
+  Index: Integer;
+begin
+  Result := 0;
+  Index := FSortFields.IndexOf(FieldName);
+  if Index >= 0 then
+    Result := Integer(FSortFields.Objects[Index]);
+end;
+
+procedure TMainForm.GridFilterClick(Column: TColumn);
+var
+  Index: Integer;
+  Existing, NewFilter: TColumnFilter;
+  Editor: TColumnFilterDialog;
+begin
+  if Column.Field = nil then
+    Exit;
+  Index := FColumnFilters.IndexOf(Column.FieldName);
+  Existing := nil;
+  if Index >= 0 then
+    Existing := TColumnFilter(FColumnFilters.Objects[Index]);
+  Editor := TColumnFilterDialog.CreateForField(Self, Column.Field, Existing);
+  try
+    if Editor.ShowModal <> mrOk then
+      Exit;
+    NewFilter := Editor.TakeFilter;
+  finally
+    Editor.Free;
+  end;
+  if Index >= 0 then
+  begin
+    Existing.Free;
+    FColumnFilters.Delete(Index);
+  end;
+  if NewFilter <> nil then
+    FColumnFilters.AddObject(Column.FieldName, NewFilter);
+  ApplySearch;
+end;
+
+procedure TMainForm.GridTitleClick(Column: TColumn);
+var
+  P: TPoint;
+  OldIndex, NextDirection: Integer;
+  FieldName: string;
+  AddSecondary: Boolean;
+begin
+  if (Column.Field = nil) or Column.Field.IsBlob then
+    Exit;
+  GetCursorPos(P);
+  P := FGrid.ScreenToClient(P);
+  if FGrid.SeparatorColumnAt(P.X, P.Y) >= 0 then
+    Exit;
+  FieldName := Column.FieldName;
+  OldIndex := FSortFields.IndexOf(FieldName);
+  if OldIndex < 0 then
+    NextDirection := 1
+  else
+    NextDirection := (Integer(FSortFields.Objects[OldIndex]) + 1) mod 3;
+  AddSecondary := GetKeyState(VK_SHIFT) < 0;
+  if AddSecondary then
+  begin
+    if OldIndex >= 0 then
+      FSortFields.Delete(OldIndex);
+  end
+  else
+    FSortFields.Clear;
+  if NextDirection <> 0 then
+  begin
+    if AddSecondary and (OldIndex >= 0) then
+      FSortFields.InsertObject(OldIndex, FieldName, TObject(NextDirection))
+    else
+      FSortFields.AddObject(FieldName, TObject(NextDirection));
+  end;
+  ApplySort;
+end;
+
+procedure TMainForm.ClearSort;
+begin
+  if FSortedDataSet <> nil then
+  begin
+    FSortedDataSet.IndexName := '';
+    FSortedDataSet.DeleteIndex('GridSort');
+    FSortedDataSet := nil;
+  end;
+  FSortFields.Clear;
+end;
+
+procedure TMainForm.ApplySort;
+var
+  C: TClientDataSet;
+  I: Integer;
+  Fields, DescFields: string;
+begin
+  if FSortedDataSet <> nil then
+  begin
+    FSortedDataSet.IndexName := '';
+    FSortedDataSet.DeleteIndex('GridSort');
+    FSortedDataSet := nil;
+  end;
+  C := SelectedDataSet;
+  if (C <> nil) and C.Active and (FSortFields.Count > 0) then
+  begin
+    Fields := '';
+    DescFields := '';
+    for I := 0 to FSortFields.Count - 1 do
+    begin
+      if Fields <> '' then
+        Fields := Fields + ';';
+      Fields := Fields + FSortFields[I];
+      if Integer(FSortFields.Objects[I]) = 2 then
+      begin
+        if DescFields <> '' then
+          DescFields := DescFields + ';';
+        DescFields := DescFields + FSortFields[I];
+      end;
+    end;
+    C.AddIndex('GridSort', Fields, [], DescFields);
+    C.IndexName := 'GridSort';
+    FSortedDataSet := C;
+  end;
+  if (C <> nil) and C.Active and not C.IsEmpty then
+    C.First;
+  UpdateSortTitles;
+end;
+
+procedure TMainForm.UpdateSortTitles;
+var
+  I, SortIndex, MinWidth: Integer;
+  Column: TColumn;
+  SavedFont: TFont;
+begin
+  SavedFont := TFont.Create;
+  try
+    SavedFont.Assign(FGrid.Canvas.Font);
+    for I := 0 to FGrid.Columns.Count - 1 do
+    begin
+      Column := FGrid.Columns[I];
+      if Column.Field = nil then
+        Continue;
+      if Column.Field.IsBlob then
+        Column.Title.Caption := Column.Field.DisplayLabel
+      else
+        Column.Title.Caption := '         ' + Column.Field.DisplayLabel;
+      SortIndex := FSortFields.IndexOf(Column.FieldName);
+      if SortIndex >= 0 then
+      begin
+        FGrid.Canvas.Font.Assign(Column.Title.Font);
+        MinWidth := FGrid.Canvas.TextWidth(Column.Title.Caption) + 36;
+        if Column.Width < MinWidth then
+          Column.Width := MinWidth;
+      end;
+    end;
+  finally
+    FGrid.Canvas.Font.Assign(SavedFont);
+    SavedFont.Free;
+  end;
+  FGrid.Invalidate;
+end;
+
+procedure TMainForm.GridDrawColumnCell(Sender: TObject; const Rect: TRect;
+  DataCol: Integer; Column: TColumn; State: TGridDrawState);
+begin
+  if FFilterCheck.Checked or (FSearchText = '') or (Column.Field = nil) then
+    Exit;
+  if Pos(FSearchText, AnsiUpperCase(Column.Field.DisplayText)) = 0 then
+    Exit;
+  FGrid.Canvas.Brush.Color := clYellow;
+  FGrid.Canvas.Font.Color := clBlack;
+  FGrid.DefaultDrawColumnCell(Rect, DataCol, Column, State);
 end;
 
 end.

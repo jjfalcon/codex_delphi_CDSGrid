@@ -300,6 +300,7 @@ begin
     R := ARect;
     Inc(R.Left, 2);
     R.Right := R.Left + 18;
+    Dec(R.Bottom);
     Canvas.Brush.Color := clBtnFace;
     Canvas.FillRect(R);
     X := R.Left + 8;
@@ -308,13 +309,13 @@ begin
     begin
       Canvas.Pen.Color := clGrayText;
       Canvas.Brush.Color := clBtnFace;
-      Arrow[0] := Point(X - 4, Y - 1);
-      Arrow[1] := Point(X + 4, Y - 1);
-      Arrow[2] := Point(X, Y - 5);
+      Arrow[0] := Point(X - 3, Y - 1);
+      Arrow[1] := Point(X + 3, Y - 1);
+      Arrow[2] := Point(X, Y - 4);
       Canvas.Polygon(Arrow);
-      Arrow[0] := Point(X - 4, Y + 1);
-      Arrow[1] := Point(X + 4, Y + 1);
-      Arrow[2] := Point(X, Y + 5);
+      Arrow[0] := Point(X - 3, Y + 1);
+      Arrow[1] := Point(X + 3, Y + 1);
+      Arrow[2] := Point(X, Y + 4);
       Canvas.Polygon(Arrow);
     end
     else
@@ -323,15 +324,15 @@ begin
       Canvas.Brush.Color := clBlack;
       if Direction = 1 then
       begin
-        Arrow[0] := Point(X - 4, Y + 3);
-        Arrow[1] := Point(X + 4, Y + 3);
-        Arrow[2] := Point(X, Y - 4);
+        Arrow[0] := Point(X - 3, Y + 2);
+        Arrow[1] := Point(X + 3, Y + 2);
+        Arrow[2] := Point(X, Y - 3);
       end
       else
       begin
-        Arrow[0] := Point(X - 4, Y - 3);
-        Arrow[1] := Point(X + 4, Y - 3);
-        Arrow[2] := Point(X, Y + 4);
+        Arrow[0] := Point(X - 3, Y - 2);
+        Arrow[1] := Point(X + 3, Y - 2);
+        Arrow[2] := Point(X, Y + 3);
       end;
       Canvas.Polygon(Arrow);
     end;
@@ -341,22 +342,27 @@ begin
   R := ARect;
   R.Left := R.Right - 23;
   Dec(R.Right, 5);
+  Dec(R.Bottom);
   Canvas.Brush.Color := clBtnFace;
   Canvas.FillRect(R);
   X := (R.Left + R.Right) div 2;
   Y := (R.Top + R.Bottom) div 2;
-  P[0] := Point(X - 6, Y - 4);
-  P[1] := Point(X + 6, Y - 4);
-  P[2] := Point(X + 2, Y);
-  P[3] := Point(X + 2, Y + 5);
-  P[4] := Point(X - 1, Y + 3);
+  P[0] := Point(X - 5, Y - 3);
+  P[1] := Point(X + 5, Y - 3);
+  P[2] := Point(X + 1, Y);
+  P[3] := Point(X + 1, Y + 3);
+  P[4] := Point(X - 1, Y + 2);
   P[5] := Point(X - 1, Y);
   if Active then
   begin
-    R.Left := X - 8;
-    R.Right := X + 8;
-    R.Top := Y - 8;
-    R.Bottom := Y + 8;
+    R.Left := X - 6;
+    R.Right := X + 6;
+    R.Top := Y - 6;
+    R.Bottom := Y + 6;
+    if R.Top < ARect.Top then
+      R.Top := ARect.Top;
+    if R.Bottom > ARect.Bottom - 1 then
+      R.Bottom := ARect.Bottom - 1;
     Canvas.Brush.Color := RGB(55, 115, 55);
     Canvas.FillRect(R);
     Canvas.Pen.Color := clWhite;
